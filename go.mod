@@ -3,7 +3,7 @@ module github.com/blacktop/clim8
 go 1.24
 
 require (
-	github.com/alecthomas/chroma/v2 v2.20.0
+	github.com/alecthomas/chroma/v2 v2.22.0
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/log v0.4.2
 	github.com/spf13/cobra v1.10.1
