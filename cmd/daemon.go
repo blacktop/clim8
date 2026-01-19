@@ -63,7 +63,7 @@ schedule:
   - time: "22:00"
     action: "on"
   - time: "22:15"
-    action: "temp" 
+    action: "temp"
     temperature: "68"
   - time: "06:00"
     action: "off"
@@ -264,11 +264,28 @@ func runScheduler(ctx context.Context, schedule []ScheduleItem) error {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
+	// Separate interval for state sync to reduce API calls
+	syncInterval := viper.GetDuration("daemon.sync-interval")
+	if syncInterval == 0 {
+		syncInterval = 5 * time.Minute
+	}
+	syncTicker := time.NewTicker(syncInterval)
+	defer syncTicker.Stop()
+
+	logger.Info("Scheduler started", "sync-interval", syncInterval)
+
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Info("Scheduler stopped")
 			return nil
+		case <-syncTicker.C:
+			// Check and sync device state periodically
+			if viper.GetBool("daemon.sync-state") {
+				if err := checkAndSyncDeviceState(ctx, schedule); err != nil {
+					logger.Warn("Failed to check/sync device state", "err", err)
+				}
+			}
 		case <-ticker.C:
 			now := time.Now()
 
@@ -277,13 +294,6 @@ func runScheduler(ctx context.Context, schedule []ScheduleItem) error {
 				executed = make(map[string]bool)
 				lastDay = now.Day()
 				logger.Info("New day started, reset execution tracking", "date", now.Format("2006-01-02"))
-			}
-
-			// Check and sync device state before processing schedule
-			if viper.GetBool("daemon.sync-state") {
-				if err := checkAndSyncDeviceState(ctx, schedule); err != nil {
-					logger.Warn("Failed to check/sync device state", "err", err)
-				}
 			}
 
 			if err := processSchedule(ctx, schedule, executed); err != nil {
@@ -606,7 +616,9 @@ func init() {
 	daemonCmd.Flags().Bool("dry-run", false, "Show what would be executed without actually running actions")
 	daemonCmd.Flags().String("timezone", "America/New_York", "Timezone for schedule execution")
 	daemonCmd.Flags().Bool("sync-state", true, "Check and sync device state with schedule after system wake")
+	daemonCmd.Flags().Duration("sync-interval", 5*time.Minute, "Interval between device state sync checks")
 	viper.BindPFlag("daemon.dry-run", daemonCmd.Flags().Lookup("dry-run"))
 	viper.BindPFlag("daemon.timezone", daemonCmd.Flags().Lookup("timezone"))
 	viper.BindPFlag("daemon.sync-state", daemonCmd.Flags().Lookup("sync-state"))
+	viper.BindPFlag("daemon.sync-interval", daemonCmd.Flags().Lookup("sync-interval"))
 }
