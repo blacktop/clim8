@@ -112,7 +112,8 @@ func heatingLevelToTemp(level int, unit UnitOfTemperature) int {
 	return closestKey
 }
 
-func tempToHeatingLevel(deg int, unit UnitOfTemperature) int {
+// TempToHeatingLevel converts a temperature in degrees to a raw heating level.
+func TempToHeatingLevel(deg int, unit UnitOfTemperature) int {
 	m := rawToF
 	if unit == Celsius {
 		m = rawToC

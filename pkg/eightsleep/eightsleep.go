@@ -160,7 +160,7 @@ func (c *Client) SetTemperature(ctx context.Context, degrees string) error {
 
 	url := fmt.Sprintf("%s/v1/users/%s/temperature/pod?ignoreDeviceErrors=false", appAPIURL, c.me.ID)
 	body := map[string]any{
-		"currentLevel": tempToHeatingLevel(temp, unit),
+		"currentLevel": TempToHeatingLevel(temp, unit),
 	}
 	var resp TemperatureState
 	if err := c.doJSON(ctx, http.MethodPut, url, body, &resp); err != nil {
@@ -168,7 +168,7 @@ func (c *Client) SetTemperature(ctx context.Context, degrees string) error {
 	}
 
 	for _, device := range resp.Devices {
-		if device.CurrentLevel != tempToHeatingLevel(temp, unit) {
+		if device.CurrentLevel != TempToHeatingLevel(temp, unit) {
 			return fmt.Errorf("failed to set temperature on device %s: %s", device.Device.DeviceID, device.CurrentState.Type)
 		}
 	}
