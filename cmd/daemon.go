@@ -118,8 +118,23 @@ schedule:
 			cancel()
 		}()
 
+		// Create a single Eight Sleep client for the daemon lifetime
+		cli, err := eightsleep.NewClient(
+			viper.GetString("email"),
+			viper.GetString("password"),
+			viper.GetString("daemon.timezone"),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create client: %w", err)
+		}
+		defer cli.Stop()
+
+		if err := cli.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start client: %w", err)
+		}
+
 		// Run the scheduler
-		return runScheduler(ctx, config.Schedule)
+		return runScheduler(ctx, cli, config.Schedule)
 	},
 }
 
@@ -253,7 +268,7 @@ func logUpcomingSchedule(schedule []ScheduleItem) {
 	}
 }
 
-func runScheduler(ctx context.Context, schedule []ScheduleItem) error {
+func runScheduler(ctx context.Context, cli *eightsleep.Client, schedule []ScheduleItem) error {
 	// Track executed items to prevent duplicates
 	executed := make(map[string]bool)
 	var lastDay int
@@ -274,6 +289,13 @@ func runScheduler(ctx context.Context, schedule []ScheduleItem) error {
 
 	logger.Info("Scheduler started", "sync-interval", syncInterval)
 
+	// Immediate sync on startup to catch up after sleep/wake
+	if viper.GetBool("daemon.sync-state") {
+		if err := checkAndSyncDeviceState(ctx, cli, schedule); err != nil {
+			logger.Warn("Failed initial state sync", "err", err)
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -282,7 +304,7 @@ func runScheduler(ctx context.Context, schedule []ScheduleItem) error {
 		case <-syncTicker.C:
 			// Check and sync device state periodically
 			if viper.GetBool("daemon.sync-state") {
-				if err := checkAndSyncDeviceState(ctx, schedule); err != nil {
+				if err := checkAndSyncDeviceState(ctx, cli, schedule); err != nil {
 					logger.Warn("Failed to check/sync device state", "err", err)
 				}
 			}
@@ -296,14 +318,14 @@ func runScheduler(ctx context.Context, schedule []ScheduleItem) error {
 				logger.Info("New day started, reset execution tracking", "date", now.Format("2006-01-02"))
 			}
 
-			if err := processSchedule(ctx, schedule, executed); err != nil {
+			if err := processSchedule(ctx, cli, schedule, executed); err != nil {
 				logger.Error("Error processing schedule", "err", err)
 			}
 		}
 	}
 }
 
-func processSchedule(ctx context.Context, schedule []ScheduleItem, executed map[string]bool) error {
+func processSchedule(ctx context.Context, cli *eightsleep.Client, schedule []ScheduleItem, executed map[string]bool) error {
 	now := time.Now()
 
 	// Find items that should run now (within the last minute)
@@ -342,7 +364,7 @@ func processSchedule(ctx context.Context, schedule []ScheduleItem, executed map[
 						"action", item.Action)
 				}
 
-				if err := executeAction(ctx, item); err != nil {
+				if err := executeAction(ctx, cli, item); err != nil {
 					logger.Error("Failed to execute action",
 						"action", item.Action,
 						"err", err)
@@ -357,7 +379,7 @@ func processSchedule(ctx context.Context, schedule []ScheduleItem, executed map[
 	return nil
 }
 
-func executeAction(ctx context.Context, item ScheduleItem) error {
+func executeAction(ctx context.Context, cli *eightsleep.Client, item ScheduleItem) error {
 	// Check if this is a dry run
 	if viper.GetBool("daemon.dry-run") {
 		if item.Temperature != "" {
@@ -369,21 +391,6 @@ func executeAction(ctx context.Context, item ScheduleItem) error {
 				"action", item.Action)
 		}
 		return nil
-	}
-
-	// Create Eight Sleep client
-	cli, err := eightsleep.NewClient(
-		viper.GetString("email"),
-		viper.GetString("password"),
-		viper.GetString("daemon.timezone"),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create client: %w", err)
-	}
-	defer cli.Stop()
-
-	if err := cli.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start client: %w", err)
 	}
 
 	switch item.Action {
@@ -461,7 +468,7 @@ func getExpectedState(schedule []ScheduleItem, now time.Time) (*ScheduleItem, er
 }
 
 // checkAndSyncDeviceState checks if the device is in the expected state and corrects it if needed
-func checkAndSyncDeviceState(ctx context.Context, schedule []ScheduleItem) error {
+func checkAndSyncDeviceState(ctx context.Context, cli *eightsleep.Client, schedule []ScheduleItem) error {
 	// Skip if dry run mode
 	if viper.GetBool("daemon.dry-run") {
 		return nil
@@ -476,21 +483,6 @@ func checkAndSyncDeviceState(ctx context.Context, schedule []ScheduleItem) error
 	// If no expected state (e.g., before first scheduled item today), do nothing
 	if expectedState == nil {
 		return nil
-	}
-
-	// Create client to check current state
-	cli, err := eightsleep.NewClient(
-		viper.GetString("email"),
-		viper.GetString("password"),
-		viper.GetString("daemon.timezone"),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create client: %w", err)
-	}
-	defer cli.Stop()
-
-	if err := cli.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start client: %w", err)
 	}
 
 	// Get current device state
@@ -511,7 +503,7 @@ func checkAndSyncDeviceState(ctx context.Context, schedule []ScheduleItem) error
 			"expected_temp", expectedState.Temperature)
 
 		// Execute the expected action to sync state
-		if err := executeAction(ctx, *expectedState); err != nil {
+		if err := executeAction(ctx, cli, *expectedState); err != nil {
 			return fmt.Errorf("failed to sync device state: %w", err)
 		}
 
