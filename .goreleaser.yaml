@@ -76,7 +76,9 @@ brews:
       fish_completion.install "completions/_fish" => "clim8.fish"
     service: |
       run [opt_bin/"clim8", "daemon"]
+      keep_alive true
       log_path var/"log/clim8.log"
+      error_log_path var/"log/clim8.log"
     test: |
       system "#{bin}/clim8 --help"
 
