@@ -5,8 +5,10 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,7 +36,65 @@ const (
 	MAX_TEMP_F = 110
 	MIN_TEMP_C = 13
 	MAX_TEMP_C = 44
+
+	// Retry configuration
+	retryMaxAttempts     = 5
+	retryInitialInterval = 500 * time.Millisecond
+	retryMaxInterval     = 30 * time.Second
+	retryMultiplier      = 2.0
+	retryJitterFactor    = 0.5 // adds up to 50% random jitter
 )
+
+// permanentError wraps an error that should not be retried
+type permanentError struct{ error }
+
+func (e permanentError) Unwrap() error { return e.error }
+
+// retryWithBackoff executes fn with exponential backoff and jitter.
+// It retries on transient errors but stops immediately on permanent errors or context cancellation.
+func retryWithBackoff(ctx context.Context, fn func() error) error {
+	var lastErr error
+	interval := retryInitialInterval
+
+	for attempt := range retryMaxAttempts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+
+		// Don't retry permanent errors
+		var permErr permanentError
+		if errors.As(lastErr, &permErr) {
+			return permErr.error
+		}
+
+		// Don't sleep after last attempt
+		if attempt == retryMaxAttempts-1 {
+			break
+		}
+
+		// Calculate sleep with jitter: interval * (1 + random[0, jitterFactor])
+		jitter := time.Duration(float64(interval) * retryJitterFactor * rand.Float64())
+		sleep := interval + jitter
+
+		log.Debug("retrying request", "attempt", attempt+1, "sleep", sleep, "err", lastErr)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sleep):
+		}
+
+		// Exponential increase, capped at max
+		interval = min(time.Duration(float64(interval)*retryMultiplier), retryMaxInterval)
+	}
+
+	return fmt.Errorf("max retries exceeded: %w", lastErr)
+}
 
 var POSSIBLE_SLEEP_STAGES = []string{"bedTimeLevel", "initialSleepLevel", "finalSleepLevel"}
 
@@ -540,52 +600,65 @@ func (c *Client) fetchAutopilotDetails(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) doJSON(ctx context.Context, method, url string, payload any, out any) error {
-	var body *bytes.Reader
-
+func (c *Client) doJSON(ctx context.Context, method, reqURL string, payload any, out any) error {
+	var payloadBytes []byte
 	if payload != nil {
 		b, err := json.Marshal(payload)
 		if err != nil {
 			return fmt.Errorf("failed to marshal payload: %w", err)
 		}
-		body = bytes.NewReader(b)
-	} else {
-		body = bytes.NewReader(nil)
+		payloadBytes = b
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header = c.headers()
-
-	res, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to execute %s request: %w", method, err)
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d: %s", res.StatusCode, res.Status)
-	}
-
-	data, err := io.ReadAll(res.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if res.Header.Get("Content-Encoding") == "gzip" {
-		gzipReader, err := gzip.NewReader(bytes.NewReader(data))
+	var data []byte
+	err := retryWithBackoff(ctx, func() error {
+		body := bytes.NewReader(payloadBytes)
+		req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
 		if err != nil {
-			return fmt.Errorf("failed to create gzip reader: %w", err)
+			return permanentError{fmt.Errorf("failed to create request: %w", err)}
 		}
-		data, err = io.ReadAll(gzipReader)
+		req.Header = c.headers()
+
+		res, err := c.http.Do(req)
 		if err != nil {
-			return fmt.Errorf("failed to read gzipped response body: %w", err)
+			// Network errors are transient, retry them
+			return fmt.Errorf("failed to execute %s request: %w", method, err)
 		}
+		defer res.Body.Close()
+
+		data, err = io.ReadAll(res.Body)
+		if err != nil {
+			return fmt.Errorf("failed to read response body: %w", err)
+		}
+
+		if res.StatusCode >= 300 {
+			httpErr := fmt.Errorf("HTTP %d: %s", res.StatusCode, res.Status)
+			// 4xx errors (except 429 rate limit) are permanent - don't retry
+			if res.StatusCode >= 400 && res.StatusCode < 500 && res.StatusCode != 429 {
+				return permanentError{httpErr}
+			}
+			// 429 and 5xx are transient, retry them
+			return httpErr
+		}
+
+		if res.Header.Get("Content-Encoding") == "gzip" {
+			gzipReader, err := gzip.NewReader(bytes.NewReader(data))
+			if err != nil {
+				return permanentError{fmt.Errorf("failed to create gzip reader: %w", err)}
+			}
+			data, err = io.ReadAll(gzipReader)
+			if err != nil {
+				return fmt.Errorf("failed to read gzipped response body: %w", err)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
-	log.Debugf("HTTP %s %s: %d\n%s", method, url, res.StatusCode, string(data))
+	log.Debugf("HTTP %s %s\n%s", method, reqURL, string(data))
 
 	return json.NewDecoder(bytes.NewReader(data)).Decode(out)
 }
