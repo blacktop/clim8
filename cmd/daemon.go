@@ -302,6 +302,11 @@ func runScheduler(ctx context.Context, cli *eightsleep.Client, schedule []Schedu
 			logger.Info("Scheduler stopped")
 			return nil
 		case <-syncTicker.C:
+			// Refresh device cache periodically to avoid stale data
+			if err := cli.RefreshDevices(ctx); err != nil {
+				logger.Warn("Failed to refresh device cache", "err", err)
+			}
+
 			// Check and sync device state periodically
 			if viper.GetBool("daemon.sync-state") {
 				if err := checkAndSyncDeviceState(ctx, cli, schedule); err != nil {
@@ -408,11 +413,17 @@ func executeAction(ctx context.Context, cli *eightsleep.Client, item ScheduleIte
 
 	case "temp":
 		// Turn on first, then set temperature
+		// If SetTemperature fails, attempt rollback by turning off
 		if err := cli.TurnOn(ctx); err != nil {
 			return fmt.Errorf("failed to turn on before setting temperature: %w", err)
 		}
 
 		if err := cli.SetTemperature(ctx, item.Temperature); err != nil {
+			// Attempt rollback - best effort, don't fail if rollback fails
+			logger.Warn("SetTemperature failed, attempting rollback by turning off", "err", err)
+			if rollbackErr := cli.TurnOff(ctx); rollbackErr != nil {
+				logger.Error("rollback (TurnOff) also failed", "err", rollbackErr)
+			}
 			return fmt.Errorf("failed to set temperature: %w", err)
 		}
 		logger.Info("Temperature set", "temp", item.Temperature)
@@ -533,31 +544,17 @@ func deviceStateMatches(currentState *eightsleep.TemperatureState, expectedItem 
 			return false, nil
 		}
 
-		// Parse expected temperature
 		if expectedItem.Temperature == "" {
 			return false, fmt.Errorf("temperature action requires temperature value")
 		}
 
-		var unit eightsleep.UnitOfTemperature
-		switch {
-		case strings.HasSuffix(expectedItem.Temperature, "C"):
-			unit = eightsleep.Celsius
-		case strings.HasSuffix(expectedItem.Temperature, "F"):
-			unit = eightsleep.Fahrenheit
-		default:
-			return false, fmt.Errorf("invalid temperature format: %s", expectedItem.Temperature)
-		}
-
-		tempStr := strings.Trim(expectedItem.Temperature, "CF")
-		expectedTemp, err := strconv.Atoi(tempStr)
+		expectedTemp, unit, err := eightsleep.ParseTemperature(expectedItem.Temperature)
 		if err != nil {
-			return false, fmt.Errorf("invalid temperature value: %s", tempStr)
+			return false, err
 		}
 
-		// Convert expected temperature to heating level for comparison
 		expectedLevel := eightsleep.TempToHeatingLevel(expectedTemp, unit)
 
-		// Allow some tolerance for heating level comparison (plus/minus 2 levels)
 		const tolerance = 2
 		diff := device.CurrentLevel - expectedLevel
 		if diff < 0 {

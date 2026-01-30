@@ -63,6 +63,11 @@ var tempCmd = &cobra.Command{
 		}
 
 		if err := cli.SetTemperature(cmd.Context(), temperature); err != nil {
+			// Attempt rollback - best effort, don't fail if rollback fails
+			logger.Warn("SetTemperature failed, attempting rollback by turning off", "err", err)
+			if rollbackErr := cli.TurnOff(cmd.Context()); rollbackErr != nil {
+				logger.Error("rollback (TurnOff) also failed", "err", rollbackErr)
+			}
 			return err
 		}
 		logger.Info("Temperature Set", "temp", temperature)

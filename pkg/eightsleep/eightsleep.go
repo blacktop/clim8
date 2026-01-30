@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,7 +32,7 @@ const (
 	knownClientSecret = "f0954a3ed5763ba3d06834c73731a32f15f168f47d4f164751275def86db0c76"
 
 	tokenRefreshBufferSec = 120
-	defaultTimeoutSec     = 240
+	defaultTimeoutSec     = 30
 
 	MIN_TEMP_F = 55
 	MAX_TEMP_F = 110
@@ -121,6 +123,25 @@ func NewClient(email, password, tz string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load timezone %s: %w", tz, err)
 	}
+
+	// Configure transport to prevent HTTP/2 hangs and set reasonable limits
+	// Disable HTTP/2 to prevent connection hangs
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+		ForceAttemptHTTP2:     false, // Disable HTTP/2 to prevent hangs
+		MaxIdleConns:          10,
+		MaxIdleConnsPerHost:   5,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+
 	return &Client{
 		email:        email,
 		password:     password,
@@ -128,7 +149,8 @@ func NewClient(email, password, tz string) (*Client, error) {
 		clientID:     knownClientID,
 		clientSecret: knownClientSecret,
 		http: &http.Client{
-			Timeout: time.Second * defaultTimeoutSec,
+			Timeout:   time.Second * defaultTimeoutSec,
+			Transport: transport,
 		},
 	}, nil
 }
@@ -165,6 +187,10 @@ func (c *Client) TurnOn(ctx context.Context) error {
 		return fmt.Errorf("failed to turn on device: %w", err)
 	}
 
+	if len(resp.Devices) == 0 {
+		return fmt.Errorf("no devices in turn-on response")
+	}
+
 	for _, device := range resp.Devices {
 		if device.CurrentState.Type == "off" {
 			return fmt.Errorf("failed to turn on device %s: %s", device.Device.DeviceID, device.CurrentState.Type)
@@ -182,6 +208,10 @@ func (c *Client) TurnOff(ctx context.Context) error {
 	var resp TemperatureState
 	if err := c.doJSON(ctx, http.MethodPut, url, body, &resp); err != nil {
 		return fmt.Errorf("failed to turn off device: %w", err)
+	}
+
+	if len(resp.Devices) == 0 {
+		return fmt.Errorf("no devices in turn-off response")
 	}
 
 	for _, device := range resp.Devices {
@@ -202,8 +232,11 @@ func (c *Client) GetTemperatureState(ctx context.Context) (*TemperatureState, er
 	return &resp, nil
 }
 
-func (c *Client) SetTemperature(ctx context.Context, degrees string) error {
-	// parse degrees
+// temperatureTolerance is the acceptable difference in heating levels for validation
+const temperatureTolerance = 2
+
+// ParseTemperature parses a temperature string like "68F" or "24C" into value and unit
+func ParseTemperature(degrees string) (int, UnitOfTemperature, error) {
 	var unit UnitOfTemperature
 	switch {
 	case strings.HasSuffix(degrees, "C"):
@@ -211,25 +244,62 @@ func (c *Client) SetTemperature(ctx context.Context, degrees string) error {
 	case strings.HasSuffix(degrees, "F"):
 		unit = Fahrenheit
 	default:
-		return fmt.Errorf("invalid temperature format: %s (must end with C or F)", degrees)
+		return 0, "", fmt.Errorf("invalid temperature format: %s (must end with C or F)", degrees)
 	}
-	temp, err := strconv.Atoi(strings.Trim(degrees, "CF"))
+	temp, err := strconv.Atoi(strings.TrimRight(degrees, "CF"))
 	if err != nil {
-		return fmt.Errorf("invalid temperature value: %s", degrees)
+		return 0, "", fmt.Errorf("invalid temperature value: %s", degrees)
+	}
+	return temp, unit, nil
+}
+
+func (c *Client) SetTemperature(ctx context.Context, degrees string) error {
+	temp, unit, err := ParseTemperature(degrees)
+	if err != nil {
+		return err
 	}
 
+	expectedLevel := TempToHeatingLevel(temp, unit)
 	url := fmt.Sprintf("%s/v1/users/%s/temperature/pod?ignoreDeviceErrors=false", appAPIURL, c.me.ID)
 	body := map[string]any{
-		"currentLevel": TempToHeatingLevel(temp, unit),
+		"currentLevel": expectedLevel,
 	}
 	var resp TemperatureState
 	if err := c.doJSON(ctx, http.MethodPut, url, body, &resp); err != nil {
 		return fmt.Errorf("failed to set temperature: %w", err)
 	}
 
+	if len(resp.Devices) == 0 {
+		return fmt.Errorf("no devices in temperature response")
+	}
+
+	// Validate response with tolerance
 	for _, device := range resp.Devices {
-		if device.CurrentLevel != TempToHeatingLevel(temp, unit) {
-			return fmt.Errorf("failed to set temperature on device %s: %s", device.Device.DeviceID, device.CurrentState.Type)
+		if diff := abs(device.CurrentLevel - expectedLevel); diff > temperatureTolerance {
+			return fmt.Errorf("failed to set temperature on device %s: expected level %d, got %d (diff %d > tolerance %d)",
+				device.Device.DeviceID, expectedLevel, device.CurrentLevel, diff, temperatureTolerance)
+		}
+	}
+
+	// Re-verify by querying actual state
+	verifyState, err := c.GetTemperatureState(ctx)
+	if err != nil {
+		log.Warn("failed to verify temperature state after set", "err", err)
+		return nil
+	}
+
+	if len(verifyState.Devices) == 0 {
+		log.Warn("no devices in verification response")
+		return nil
+	}
+
+	for _, device := range verifyState.Devices {
+		if diff := abs(device.CurrentLevel - expectedLevel); diff > temperatureTolerance {
+			log.Warn("temperature verification mismatch",
+				"device", device.Device.DeviceID,
+				"expected", expectedLevel,
+				"actual", device.CurrentLevel,
+				"diff", diff)
 		}
 	}
 
@@ -375,12 +445,21 @@ func (c *Client) headers() http.Header {
 	h.Set("Accept", "application/json")
 	h.Set("Accept-Encoding", "gzip")
 	h.Set("User-Agent", "okhttp/4.9.3")
+	h.Set("Connection", "keep-alive")
 	c.mu.RLock()
 	if c.token != nil {
 		h.Set("Authorization", "Bearer "+c.token.Bearer)
 	}
 	c.mu.RUnlock()
 	return h
+}
+
+// clearToken invalidates the cached token, forcing re-auth on next request
+func (c *Client) clearToken() {
+	c.mu.Lock()
+	c.token = nil
+	c.mu.Unlock()
+	log.Debug("token cleared, will re-authenticate on next request")
 }
 
 func (c *Client) refreshToken(ctx context.Context) error {
@@ -391,6 +470,17 @@ func (c *Client) refreshToken(ctx context.Context) error {
 		return nil
 	}
 
+	err := retryWithBackoff(ctx, func() error {
+		return c.doTokenRefresh(ctx)
+	})
+	if err != nil {
+		return fmt.Errorf("token refresh failed: %w", err)
+	}
+	return nil
+}
+
+// doTokenRefresh performs the actual token refresh request
+func (c *Client) doTokenRefresh(ctx context.Context) error {
 	body := map[string]string{
 		"client_id":     c.clientID,
 		"client_secret": c.clientSecret,
@@ -414,6 +504,7 @@ func (c *Client) refreshToken(ctx context.Context) error {
 		MainID:     res.UserID,
 	}
 	c.mu.Unlock()
+	log.Debug("token refreshed", "expires_in", res.ExpiresIn)
 	return nil
 }
 
@@ -441,17 +532,44 @@ func (c *Client) fetchProfile(ctx context.Context) error {
 
 func (c *Client) fetchDevices(ctx context.Context) error {
 	for _, device := range c.me.Devices {
-		url := clientAPIURL + "/devices/" + device
+		reqURL := clientAPIURL + "/devices/" + device
 		var data struct {
 			Result Device `json:"result"`
 		}
-		if err := c.doJSON(ctx, http.MethodGet, url, nil, &data); err != nil {
+		if err := c.doJSON(ctx, http.MethodGet, reqURL, nil, &data); err != nil {
 			return fmt.Errorf("failed to fetch device %s: %w", device, err)
 		}
 		c.mu.Lock()
 		c.devices = append(c.devices, data.Result)
 		c.mu.Unlock()
 	}
+	return nil
+}
+
+// RefreshDevices refreshes the cached device list from the API.
+// Call this periodically from daemon to keep device cache fresh.
+func (c *Client) RefreshDevices(ctx context.Context) error {
+	c.mu.RLock()
+	deviceIDs := c.me.Devices
+	c.mu.RUnlock()
+
+	var newDevices []Device
+	for _, deviceID := range deviceIDs {
+		reqURL := clientAPIURL + "/devices/" + deviceID
+		var data struct {
+			Result Device `json:"result"`
+		}
+		if err := c.doJSON(ctx, http.MethodGet, reqURL, nil, &data); err != nil {
+			return fmt.Errorf("failed to refresh device %s: %w", deviceID, err)
+		}
+		newDevices = append(newDevices, data.Result)
+	}
+
+	c.mu.Lock()
+	c.devices = newDevices
+	c.mu.Unlock()
+
+	log.Debug("device cache refreshed", "count", len(newDevices))
 	return nil
 }
 
@@ -611,49 +729,72 @@ func (c *Client) doJSON(ctx context.Context, method, reqURL string, payload any,
 	}
 
 	var data []byte
-	err := retryWithBackoff(ctx, func() error {
-		body := bytes.NewReader(payloadBytes)
-		req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
-		if err != nil {
-			return permanentError{fmt.Errorf("failed to create request: %w", err)}
-		}
-		req.Header = c.headers()
+	var got401 bool
 
-		res, err := c.http.Do(req)
-		if err != nil {
-			// Network errors are transient, retry them
-			return fmt.Errorf("failed to execute %s request: %w", method, err)
-		}
-		defer res.Body.Close()
-
-		data, err = io.ReadAll(res.Body)
-		if err != nil {
-			return fmt.Errorf("failed to read response body: %w", err)
-		}
-
-		if res.StatusCode >= 300 {
-			httpErr := fmt.Errorf("HTTP %d: %s", res.StatusCode, res.Status)
-			// 4xx errors (except 429 rate limit) are permanent - don't retry
-			if res.StatusCode >= 400 && res.StatusCode < 500 && res.StatusCode != 429 {
-				return permanentError{httpErr}
-			}
-			// 429 and 5xx are transient, retry them
-			return httpErr
-		}
-
-		if res.Header.Get("Content-Encoding") == "gzip" {
-			gzipReader, err := gzip.NewReader(bytes.NewReader(data))
+	doRequest := func() error {
+		return retryWithBackoff(ctx, func() error {
+			body := bytes.NewReader(payloadBytes)
+			req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
 			if err != nil {
-				return permanentError{fmt.Errorf("failed to create gzip reader: %w", err)}
+				return permanentError{fmt.Errorf("failed to create request: %w", err)}
 			}
-			data, err = io.ReadAll(gzipReader)
+			req.Header = c.headers()
+
+			res, err := c.http.Do(req)
 			if err != nil {
-				return fmt.Errorf("failed to read gzipped response body: %w", err)
+				return fmt.Errorf("failed to execute %s request: %w", method, err)
 			}
+			defer res.Body.Close()
+
+			data, err = io.ReadAll(res.Body)
+			if err != nil {
+				return fmt.Errorf("failed to read response body: %w", err)
+			}
+
+			if res.StatusCode >= 300 {
+				httpErr := fmt.Errorf("HTTP %d: %s", res.StatusCode, res.Status)
+
+				if res.StatusCode == 401 {
+					got401 = true
+					return permanentError{httpErr}
+				}
+
+				if res.StatusCode >= 400 && res.StatusCode < 500 && res.StatusCode != 429 {
+					return permanentError{httpErr}
+				}
+				return httpErr
+			}
+
+			if res.Header.Get("Content-Encoding") == "gzip" {
+				gzipReader, err := gzip.NewReader(bytes.NewReader(data))
+				if err != nil {
+					return permanentError{fmt.Errorf("failed to create gzip reader: %w", err)}
+				}
+				data, err = io.ReadAll(gzipReader)
+				if err != nil {
+					return fmt.Errorf("failed to read gzipped response body: %w", err)
+				}
+			}
+
+			return nil
+		})
+	}
+
+	err := doRequest()
+
+	// Handle 401 with re-auth retry (skip for auth endpoint to avoid infinite loop)
+	if got401 && reqURL != authURL {
+		log.Info("received 401, clearing token and re-authenticating")
+		c.clearToken()
+
+		if refreshErr := c.refreshToken(ctx); refreshErr != nil {
+			return fmt.Errorf("re-auth failed after 401: %w", refreshErr)
 		}
 
-		return nil
-	})
+		got401 = false
+		err = doRequest()
+	}
+
 	if err != nil {
 		return err
 	}
