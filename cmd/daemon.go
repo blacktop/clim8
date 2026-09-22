@@ -43,6 +43,8 @@ type ScheduleItem struct {
 	Time        string `yaml:"time"`
 	Action      string `yaml:"action"`
 	Temperature string `yaml:"temperature,omitempty"`
+	// Side is left, right or both; empty means the account owner's side.
+	Side string `yaml:"side,omitempty"`
 }
 
 // ScheduleConfig represents the schedule configuration
@@ -67,6 +69,8 @@ schedule:
     temperature: "68"
   - time: "06:00"
     action: "off"
+
+Add side: "left", "right" or "both" to an item to control a side other than your own.
 `,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -217,6 +221,10 @@ func validateScheduleItem(item ScheduleItem) error {
 		return fmt.Errorf("invalid time format '%s': %w", item.Time, err)
 	}
 
+	if _, err := eightsleep.ParseSide(item.Side); err != nil {
+		return err
+	}
+
 	// Validate action
 	switch item.Action {
 	case "on", "off":
@@ -341,10 +349,11 @@ func processSchedule(ctx context.Context, cli *eightsleep.Client, schedule []Sch
 		}
 
 		// Create unique key for this execution
-		execKey := fmt.Sprintf("%s-%s-%s",
+		execKey := fmt.Sprintf("%s-%s-%s-%s",
 			now.Format("2006-01-02"),
 			item.Time,
-			item.Action)
+			item.Action,
+			item.Side)
 
 		// Skip if already executed today
 		if executed[execKey] {
@@ -398,15 +407,20 @@ func executeAction(ctx context.Context, cli *eightsleep.Client, item ScheduleIte
 		return nil
 	}
 
+	side, err := eightsleep.ParseSide(item.Side)
+	if err != nil {
+		return err
+	}
+
 	switch item.Action {
 	case "on":
-		if err := cli.TurnOn(ctx); err != nil {
+		if err := cli.TurnOn(ctx, side); err != nil {
 			return fmt.Errorf("failed to turn on: %w", err)
 		}
 		logger.Info("Device turned ON")
 
 	case "off":
-		if err := cli.TurnOff(ctx); err != nil {
+		if err := cli.TurnOff(ctx, side); err != nil {
 			return fmt.Errorf("failed to turn off: %w", err)
 		}
 		logger.Info("Device turned OFF")
@@ -414,14 +428,14 @@ func executeAction(ctx context.Context, cli *eightsleep.Client, item ScheduleIte
 	case "temp":
 		// Turn on first, then set temperature
 		// If SetTemperature fails, attempt rollback by turning off
-		if err := cli.TurnOn(ctx); err != nil {
+		if err := cli.TurnOn(ctx, side); err != nil {
 			return fmt.Errorf("failed to turn on before setting temperature: %w", err)
 		}
 
-		if err := cli.SetTemperature(ctx, item.Temperature); err != nil {
+		if err := cli.SetTemperature(ctx, side, item.Temperature, 0); err != nil {
 			// Attempt rollback - best effort, don't fail if rollback fails
 			logger.Warn("SetTemperature failed, attempting rollback by turning off", "err", err)
-			if rollbackErr := cli.TurnOff(ctx); rollbackErr != nil {
+			if rollbackErr := cli.TurnOff(ctx, side); rollbackErr != nil {
 				logger.Error("rollback (TurnOff) also failed", "err", rollbackErr)
 			}
 			return fmt.Errorf("failed to set temperature: %w", err)
@@ -478,15 +492,31 @@ func getExpectedState(schedule []ScheduleItem, now time.Time) (*ScheduleItem, er
 	return mostRecentItem, nil
 }
 
-// checkAndSyncDeviceState checks if the device is in the expected state and corrects it if needed
-func checkAndSyncDeviceState(ctx context.Context, cli *eightsleep.Client, schedule []ScheduleItem) error {
+// checkAndSyncDeviceState checks if the device is in the expected state and corrects it if needed.
+// Each side value in the schedule is evaluated on its own, so items for one side never hide the
+// expected state of another.
+func checkAndSyncDeviceState(
+	ctx context.Context, cli *eightsleep.Client, schedule []ScheduleItem,
+) error {
 	// Skip if dry run mode
 	if viper.GetBool("daemon.dry-run") {
 		return nil
 	}
 
-	now := time.Now()
-	expectedState, err := getExpectedState(schedule, now)
+	bySide := make(map[string][]ScheduleItem)
+	for _, item := range schedule {
+		bySide[item.Side] = append(bySide[item.Side], item)
+	}
+	for _, items := range bySide {
+		if err := syncSideState(ctx, cli, items); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syncSideState(ctx context.Context, cli *eightsleep.Client, schedule []ScheduleItem) error {
+	expectedState, err := getExpectedState(schedule, time.Now())
 	if err != nil {
 		return fmt.Errorf("failed to determine expected state: %w", err)
 	}
@@ -496,14 +526,19 @@ func checkAndSyncDeviceState(ctx context.Context, cli *eightsleep.Client, schedu
 		return nil
 	}
 
+	side, err := eightsleep.ParseSide(expectedState.Side)
+	if err != nil {
+		return err
+	}
+
 	// Get current device state
-	currentState, err := cli.GetTemperatureState(ctx)
+	currentStates, err := cli.GetTemperatureStates(ctx, side)
 	if err != nil {
 		return fmt.Errorf("failed to get current temperature state: %w", err)
 	}
 
 	// Check if device state matches expected state
-	stateMatches, err := deviceStateMatches(currentState, expectedState)
+	stateMatches, err := deviceStateMatches(currentStates, expectedState)
 	if err != nil {
 		return fmt.Errorf("failed to check device state: %w", err)
 	}
@@ -511,7 +546,8 @@ func checkAndSyncDeviceState(ctx context.Context, cli *eightsleep.Client, schedu
 	if !stateMatches {
 		logger.Info("Device state doesn't match expected state, syncing...",
 			"expected_action", expectedState.Action,
-			"expected_temp", expectedState.Temperature)
+			"expected_temp", expectedState.Temperature,
+			"side", expectedState.Side)
 
 		// Execute the expected action to sync state
 		if err := executeAction(ctx, cli, *expectedState); err != nil {
@@ -524,23 +560,38 @@ func checkAndSyncDeviceState(ctx context.Context, cli *eightsleep.Client, schedu
 	return nil
 }
 
-// deviceStateMatches checks if the current device state matches the expected schedule item
-func deviceStateMatches(currentState *eightsleep.TemperatureState, expectedItem *ScheduleItem) (bool, error) {
-	if len(currentState.Devices) == 0 {
-		return false, fmt.Errorf("no devices found in current state")
+// deviceStateMatches checks if every targeted side matches the expected schedule item
+func deviceStateMatches(
+	states []eightsleep.TemperatureState, expectedItem *ScheduleItem,
+) (bool, error) {
+	if len(states) == 0 {
+		return false, fmt.Errorf("no temperature states to compare")
 	}
+	for _, state := range states {
+		if len(state.Devices) == 0 {
+			return false, fmt.Errorf("no devices found in current state")
+		}
+		matches, err := sideStateMatches(state.Devices[0].CurrentState.Type,
+			state.Devices[0].CurrentLevel, expectedItem)
+		if err != nil || !matches {
+			return false, err
+		}
+	}
+	return true, nil
+}
 
-	device := currentState.Devices[0] // Assuming single device
-
+func sideStateMatches(
+	stateType string, currentLevel int, expectedItem *ScheduleItem,
+) (bool, error) {
 	switch expectedItem.Action {
 	case "off":
-		return device.CurrentState.Type == "off", nil
+		return stateType == "off", nil
 
 	case "on":
-		return device.CurrentState.Type != "off", nil
+		return stateType != "off", nil
 
 	case "temp":
-		if device.CurrentState.Type == "off" {
+		if stateType == "off" {
 			return false, nil
 		}
 
@@ -556,7 +607,7 @@ func deviceStateMatches(currentState *eightsleep.TemperatureState, expectedItem 
 		expectedLevel := eightsleep.TempToHeatingLevel(expectedTemp, unit)
 
 		const tolerance = 2
-		diff := device.CurrentLevel - expectedLevel
+		diff := currentLevel - expectedLevel
 		if diff < 0 {
 			diff = -diff
 		}

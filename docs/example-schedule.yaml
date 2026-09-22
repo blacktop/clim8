@@ -30,5 +30,11 @@ schedule:
   - time: "06:00"
     action: "off"
 
+  # Any item can target another side with side: "left", "right" or "both".
+  # Without it, the item controls your own side.
+  # - time: "22:30"
+  #   action: "on"
+  #   side: "right"
+
 # Enable verbose logging (optional)
 verbose: false 

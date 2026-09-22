@@ -23,9 +23,11 @@ package cmd
 
 import (
 	"fmt"
+	"io"
+	"strings"
+	"time"
 
 	"github.com/blacktop/clim8/pkg/eightsleep"
-	"github.com/charmbracelet/log"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -36,28 +38,105 @@ var statusCmd = &cobra.Command{
 	Short: "Show Eight Sleep status",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if viper.GetBool("verbose") {
-			logger.SetLevel(log.DebugLevel)
-		}
-
-		cli, err := eightsleep.NewClient(
-			viper.GetString("email"),
-			viper.GetString("password"),
-			"America/New_York",
-		)
+		cli, err := startClient(cmd.Context())
 		if err != nil {
-			return fmt.Errorf("failed to create client: %w", err)
+			return err
 		}
 		defer cli.Stop()
 
-		if err := cli.Start(cmd.Context()); err != nil {
-			return fmt.Errorf("failed to start client: %w", err)
+		pods := cli.Status()
+		if viper.GetBool("json") {
+			return printJSON(cmd.OutOrStdout(), pods, false)
 		}
-		logger.Info("STATUS")
-		cli.Status(cmd.Context())
-
+		if len(pods) == 0 {
+			return fmt.Errorf("no Eight Sleep devices found on this account")
+		}
+		for _, pod := range pods {
+			if err := renderPodStatus(cmd.OutOrStdout(), pod, cli.UserID()); err != nil {
+				return err
+			}
+		}
 		return nil
 	},
+}
+
+func renderPodStatus(w io.Writer, pod eightsleep.PodStatus, myUserID string) error {
+	connection := "OFFLINE"
+	if pod.Online {
+		connection = "online"
+	}
+	firmware := pod.FirmwareVersion
+	if pod.FirmwareUpdating {
+		firmware += " (updating)"
+	}
+	water := "ok"
+	if !pod.HasWater {
+		water = "LOW - refill the hub"
+	}
+	priming := "last primed " + formatTime(pod.LastPrime)
+	switch {
+	case pod.Priming:
+		priming = "in progress"
+	case pod.NeedsPriming:
+		priming = "NEEDED - run `clim8 prime`"
+	}
+
+	model := pod.Model
+	if model == "" {
+		model = "Pod"
+	}
+	lines := []string{
+		fmt.Sprintf("%s (%s)", model, pod.DeviceID),
+		fmt.Sprintf("  Hub:      %s, last heard %s, wifi %d dBm",
+			connection, formatTime(pod.LastHeard), pod.WifiSignal),
+		"  Firmware: " + firmware,
+		"  Water:    " + water,
+		"  Priming:  " + priming,
+	}
+	for _, side := range pod.Sides {
+		lines = append(lines,
+			fmt.Sprintf("  %-9s %s", sideLabel(side, myUserID), sideSummary(side, pod.Unit)))
+	}
+	_, err := fmt.Fprintln(w, strings.Join(lines, "\n"))
+	return err
+}
+
+func sideLabel(side eightsleep.SideStatus, myUserID string) string {
+	label := string(side.Side) + ":"
+	if side.UserID != "" && side.UserID == myUserID {
+		label = string(side.Side) + "*:"
+	}
+	return label
+}
+
+func sideSummary(side eightsleep.SideStatus, unit eightsleep.UnitOfTemperature) string {
+	switch {
+	case side.UserID == "":
+		return "unassigned"
+	case side.Away:
+		return "AWAY"
+	case !side.Active:
+		return "OFF"
+	}
+	degrees := "°F"
+	if unit == eightsleep.Celsius {
+		degrees = "°C"
+	}
+	summary := fmt.Sprintf("ON  %d%s (level %d)", side.Temperature, degrees, side.Level)
+	if side.Temperature != side.Target {
+		summary += fmt.Sprintf(" -> %d%s (level %d)", side.Target, degrees, side.TargetLevel)
+	}
+	if side.Activity != "" {
+		summary += "  [" + side.Activity + "]"
+	}
+	return summary
+}
+
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	return t.Local().Format("2006-01-02 15:04")
 }
 
 func init() {

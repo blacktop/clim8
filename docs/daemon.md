@@ -46,6 +46,25 @@ verbose: false
 - **`off`** - Turn off the Eight Sleep pod  
 - **`temp`** - Set temperature (requires `temperature` field with F or C suffix)
 
+## Sides
+
+Every item controls your own side of the bed unless it names another one:
+
+```yaml
+schedule:
+  - time: "22:00"
+    action: "on"
+    side: "both"       # "left", "right" or "both"
+  - time: "22:15"
+    action: "temp"
+    temperature: "66F"
+    side: "right"
+```
+
+State sync (`--sync-state`) tracks each `side` value separately, so items for one side never
+override the expected state of another. Avoid mixing `both` with `left`/`right` items for the
+same period: they are tracked as independent schedules and would correct each other.
+
 ## Time Format
 
 Times must be in 24-hour format (HH:MM):

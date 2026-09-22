@@ -59,11 +59,13 @@ func init() {
 	rootCmd.PersistentFlags().BoolP("verbose", "V", false, "Enable verbose debug logging")
 	rootCmd.PersistentFlags().StringP("email", "e", "", "Email address")
 	rootCmd.PersistentFlags().StringP("password", "p", "", "Password")
+	rootCmd.PersistentFlags().Bool("json", false, "Output JSON instead of text")
 	rootCmd.PersistentFlags().Bool("config-quiet", false, "silence config file loading message")
 	rootCmd.PersistentFlags().MarkHidden("config-quiet")
 	viper.BindPFlag("verbose", rootCmd.PersistentFlags().Lookup("verbose"))
 	viper.BindPFlag("email", rootCmd.PersistentFlags().Lookup("email"))
 	viper.BindPFlag("password", rootCmd.PersistentFlags().Lookup("password"))
+	cobra.CheckErr(viper.BindPFlag("json", rootCmd.PersistentFlags().Lookup("json")))
 	viper.BindPFlag("config-quiet", rootCmd.PersistentFlags().Lookup("config-quiet"))
 	// Settings
 	rootCmd.CompletionOptions.HiddenDefaultCmd = true
@@ -95,6 +97,9 @@ func initConfig() {
 var rootCmd = &cobra.Command{
 	Use:   "clim8",
 	Short: "Eight Sleep CLI",
+	// Execute logs the error; usage text only helps for flag mistakes, which --help covers.
+	SilenceUsage:  true,
+	SilenceErrors: true,
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.

@@ -24,10 +24,7 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/blacktop/clim8/pkg/eightsleep"
-	"github.com/charmbracelet/log"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
 // infoCmd represents the info command
@@ -36,35 +33,15 @@ var infoCmd = &cobra.Command{
 	Short: "Show Eight Sleep Info",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if viper.GetBool("verbose") {
-			logger.SetLevel(log.DebugLevel)
-		}
-
-		cli, err := eightsleep.NewClient(
-			viper.GetString("email"),
-			viper.GetString("password"),
-			"America/New_York",
-		)
+		cli, err := startClient(cmd.Context())
 		if err != nil {
-			return fmt.Errorf("failed to create client: %w", err)
+			return err
 		}
 		defer cli.Stop()
 
-		if err := cli.Start(cmd.Context()); err != nil {
-			return fmt.Errorf("failed to start client: %w", err)
-		}
-
-		if err := cli.TurnOn(cmd.Context()); err != nil {
-			return err
-		}
-
 		logger.Info("INFO")
-		if _, err := cli.Info(cmd.Context()); err != nil {
+		if err := cli.Info(cmd.Context()); err != nil {
 			return fmt.Errorf("failed to get info: %w", err)
-		}
-
-		if err := cli.TurnOff(cmd.Context()); err != nil {
-			return err
 		}
 
 		return nil

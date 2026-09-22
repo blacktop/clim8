@@ -64,6 +64,7 @@ type Profile struct {
 type Device struct {
 	ID                     string `json:"deviceId"`
 	OwnerID                string `json:"ownerId"`
+	LeftUserID             string `json:"leftUserId"`
 	LeftHeatingLevel       int    `json:"leftHeatingLevel"`
 	LeftTargetHeatingLevel int    `json:"leftTargetHeatingLevel"`
 	LeftNowHeating         bool   `json:"leftNowHeating"`

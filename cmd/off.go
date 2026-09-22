@@ -22,12 +22,7 @@ THE SOFTWARE.
 package cmd
 
 import (
-	"fmt"
-
-	"github.com/blacktop/clim8/pkg/eightsleep"
-	"github.com/charmbracelet/log"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
 // offCmd represents the off command
@@ -36,25 +31,17 @@ var offCmd = &cobra.Command{
 	Short: "Turn off Eight Sleep Pod",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if viper.GetBool("verbose") {
-			logger.SetLevel(log.DebugLevel)
-		}
-
-		cli, err := eightsleep.NewClient(
-			viper.GetString("email"),
-			viper.GetString("password"),
-			"America/New_York",
-		)
+		side, err := sideFlag(cmd)
 		if err != nil {
-			return fmt.Errorf("failed to create client: %w", err)
+			return err
+		}
+		cli, err := startClient(cmd.Context())
+		if err != nil {
+			return err
 		}
 		defer cli.Stop()
 
-		if err := cli.Start(cmd.Context()); err != nil {
-			return fmt.Errorf("failed to start client: %w", err)
-		}
-
-		if err := cli.TurnOff(cmd.Context()); err != nil {
+		if err := cli.TurnOff(cmd.Context(), side); err != nil {
 			return err
 		}
 		logger.Info("Device turned OFF")
@@ -65,14 +52,5 @@ var offCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(offCmd)
-
-	// Here you will define your flags and configuration settings.
-
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// offCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// offCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	addSideFlag(offCmd.Flags())
 }

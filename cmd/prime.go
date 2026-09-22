@@ -22,35 +22,45 @@ THE SOFTWARE.
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 )
 
-// onCmd represents the on command
-var onCmd = &cobra.Command{
-	Use:   "on",
-	Short: "Turn on Eight Sleep Pod",
-	Args:  cobra.NoArgs,
+// primeCmd represents the prime command
+var primeCmd = &cobra.Command{
+	Use:   "prime",
+	Short: "Start a priming cycle",
+	Long: "Start a priming cycle, which circulates water through the pod. " +
+		"The Eight Sleep app notifies you when the cycle completes.",
+	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		side, err := sideFlag(cmd)
-		if err != nil {
-			return err
-		}
 		cli, err := startClient(cmd.Context())
 		if err != nil {
 			return err
 		}
 		defer cli.Stop()
 
-		if err := cli.TurnOn(cmd.Context(), side); err != nil {
+		if err := cli.Prime(cmd.Context()); err != nil {
 			return err
 		}
-		logger.Info("Device turned ON")
 
+		// The API acknowledges the request before the pod acts on it, so ask the pod.
+		if err := cli.RefreshDevices(cmd.Context()); err != nil {
+			return fmt.Errorf("priming was requested, but the pod could not be re-read: %w", err)
+		}
+		for _, pod := range cli.Status() {
+			if pod.Priming {
+				logger.Info("Priming started")
+				return nil
+			}
+		}
+		logger.Warn("Priming was requested, but the pod does not report it yet; " +
+			"check `clim8 status` in a minute")
 		return nil
 	},
 }
 
 func init() {
-	rootCmd.AddCommand(onCmd)
-	addSideFlag(onCmd.Flags())
+	rootCmd.AddCommand(primeCmd)
 }

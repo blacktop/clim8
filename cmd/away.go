@@ -25,32 +25,42 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// onCmd represents the on command
-var onCmd = &cobra.Command{
-	Use:   "on",
-	Short: "Turn on Eight Sleep Pod",
-	Args:  cobra.NoArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		side, err := sideFlag(cmd)
-		if err != nil {
-			return err
-		}
-		cli, err := startClient(cmd.Context())
-		if err != nil {
-			return err
-		}
-		defer cli.Stop()
+// awayCmd represents the away command
+var awayCmd = &cobra.Command{
+	Use:   "away",
+	Short: "Pause the pod while you travel",
+	Long: "Away mode stops the pod from conditioning and tracking a side. " +
+		"`clim8 status` shows which sides are away.",
+}
 
-		if err := cli.TurnOn(cmd.Context(), side); err != nil {
-			return err
-		}
-		logger.Info("Device turned ON")
+func newAwayToggleCmd(use, short string, away bool) *cobra.Command {
+	return &cobra.Command{
+		Use:   use,
+		Short: short,
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			side, err := sideFlag(cmd)
+			if err != nil {
+				return err
+			}
+			cli, err := startClient(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer cli.Stop()
 
-		return nil
-	},
+			if err := cli.SetAway(cmd.Context(), side, away); err != nil {
+				return err
+			}
+			logger.Info("Away mode updated", "away", away)
+			return nil
+		},
+	}
 }
 
 func init() {
-	rootCmd.AddCommand(onCmd)
-	addSideFlag(onCmd.Flags())
+	rootCmd.AddCommand(awayCmd)
+	addSideFlag(awayCmd.PersistentFlags())
+	awayCmd.AddCommand(newAwayToggleCmd("on", "Start away mode", true))
+	awayCmd.AddCommand(newAwayToggleCmd("off", "End away mode", false))
 }

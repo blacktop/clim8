@@ -2,7 +2,6 @@ package eightsleep
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -12,7 +11,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -24,9 +22,9 @@ import (
 )
 
 const (
-	clientAPIURL = "https://client-api.8slp.net/v1"
-	appAPIURL    = "https://app-api.8slp.net"
-	authURL      = "https://auth-api.8slp.net/v1/tokens"
+	defaultClientAPIURL = "https://client-api.8slp.net/v1"
+	defaultAppAPIURL    = "https://app-api.8slp.net"
+	defaultAuthURL      = "https://auth-api.8slp.net/v1/tokens"
 
 	knownClientID     = "0894c7f33bb94800a03f1f4df13a4f38"
 	knownClientSecret = "f0954a3ed5763ba3d06834c73731a32f15f168f47d4f164751275def86db0c76"
@@ -45,18 +43,51 @@ const (
 	retryMaxInterval     = 30 * time.Second
 	retryMultiplier      = 2.0
 	retryJitterFactor    = 0.5 // adds up to 50% random jitter
+
+	maxErrorBodyBytes = 512
 )
+
+// HTTPError is returned when the API answers with a non-2xx status.
+type HTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+// SubscriptionRequired reports whether the API refused the request with its "subscription
+// required" message. The official app can still do some of what the API refuses this way, so
+// this describes the refusal rather than proving the feature itself is paid.
+func (e *HTTPError) SubscriptionRequired() bool {
+	return e.StatusCode == http.StatusForbidden && strings.Contains(e.Body, "subscription required")
+}
+
+func (e *HTTPError) Error() string {
+	if e.SubscriptionRequired() {
+		return `refused by the Eight Sleep API with HTTP 403 "subscription required"`
+	}
+	status := fmt.Sprintf("HTTP %d %s", e.StatusCode, http.StatusText(e.StatusCode))
+	if e.Body == "" {
+		return status
+	}
+	return status + ": " + e.Body
+}
 
 // permanentError wraps an error that should not be retried
 type permanentError struct{ error }
 
 func (e permanentError) Unwrap() error { return e.error }
 
-// retryWithBackoff executes fn with exponential backoff and jitter.
+// retryAfterError wraps a retryable error for which the server named a minimum wait
+type retryAfterError struct {
+	error
+	wait time.Duration
+}
+
+func (e retryAfterError) Unwrap() error { return e.error }
+
+// retryWithBackoff executes fn with exponential backoff and jitter, starting at interval.
 // It retries on transient errors but stops immediately on permanent errors or context cancellation.
-func retryWithBackoff(ctx context.Context, fn func() error) error {
+func retryWithBackoff(ctx context.Context, interval time.Duration, fn func() error) error {
 	var lastErr error
-	interval := retryInitialInterval
 
 	for attempt := range retryMaxAttempts {
 		if err := ctx.Err(); err != nil {
@@ -83,6 +114,11 @@ func retryWithBackoff(ctx context.Context, fn func() error) error {
 		jitter := time.Duration(float64(interval) * retryJitterFactor * rand.Float64())
 		sleep := interval + jitter
 
+		var retryAfter retryAfterError
+		if errors.As(lastErr, &retryAfter) && retryAfter.wait > sleep {
+			sleep = min(retryAfter.wait, retryMaxInterval)
+		}
+
 		log.Debug("retrying request", "attempt", attempt+1, "sleep", sleep, "err", lastErr)
 
 		select {
@@ -98,8 +134,6 @@ func retryWithBackoff(ctx context.Context, fn func() error) error {
 	return fmt.Errorf("max retries exceeded: %w", lastErr)
 }
 
-var POSSIBLE_SLEEP_STAGES = []string{"bedTimeLevel", "initialSleepLevel", "finalSleepLevel"}
-
 type Client struct {
 	mu sync.RWMutex
 
@@ -107,6 +141,9 @@ type Client struct {
 	tz              *time.Location
 
 	clientID, clientSecret string
+
+	clientAPIURL, appAPIURL, authURL string
+	retryInterval                    time.Duration
 
 	http  *http.Client
 	token *Token
@@ -143,11 +180,15 @@ func NewClient(email, password, tz string) (*Client, error) {
 	}
 
 	return &Client{
-		email:        email,
-		password:     password,
-		tz:           loc,
-		clientID:     knownClientID,
-		clientSecret: knownClientSecret,
+		email:         email,
+		password:      password,
+		tz:            loc,
+		clientID:      knownClientID,
+		clientSecret:  knownClientSecret,
+		clientAPIURL:  defaultClientAPIURL,
+		appAPIURL:     defaultAppAPIURL,
+		authURL:       defaultAuthURL,
+		retryInterval: retryInitialInterval,
 		http: &http.Client{
 			Timeout:   time.Second * defaultTimeoutSec,
 			Transport: transport,
@@ -164,7 +205,7 @@ func (c *Client) Start(ctx context.Context) error {
 	if err := c.fetchProfile(ctx); err != nil {
 		return fmt.Errorf("failed to fetch profile: %w", err)
 	}
-	if err := c.fetchDevices(ctx); err != nil {
+	if err := c.RefreshDevices(ctx); err != nil {
 		return fmt.Errorf("failed to fetch devices: %w", err)
 	}
 	return nil
@@ -172,164 +213,51 @@ func (c *Client) Start(ctx context.Context) error {
 
 func (c *Client) Stop() { /* nothing to close right now */ }
 
-func (c *Client) RoomTemperature(ctx context.Context) (float64, error) {
-	panic("not implemented")
-	// TODO: get trends and calculate room temperature average (average both sides if both are active)
+// UserID returns the authenticated user's ID. It is empty until Start succeeds.
+func (c *Client) UserID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.me == nil {
+		return ""
+	}
+	return c.me.ID
 }
 
-func (c *Client) TurnOn(ctx context.Context) error {
-	url := fmt.Sprintf("%s/v1/users/%s/temperature/pod?ignoreDeviceErrors=false", appAPIURL, c.me.ID)
-	body := map[string]any{
-		"currentState": map[string]string{"type": "smart"},
-	}
-	var resp TemperatureState
-	if err := c.doJSON(ctx, http.MethodPut, url, body, &resp); err != nil {
-		return fmt.Errorf("failed to turn on device: %w", err)
-	}
-
-	if len(resp.Devices) == 0 {
-		return fmt.Errorf("no devices in turn-on response")
-	}
-
-	for _, device := range resp.Devices {
-		if device.CurrentState.Type == "off" {
-			return fmt.Errorf("failed to turn on device %s: %s", device.Device.DeviceID, device.CurrentState.Type)
-		}
-	}
-
-	return nil
-}
-
-func (c *Client) TurnOff(ctx context.Context) error {
-	url := fmt.Sprintf("%s/v1/users/%s/temperature/pod?ignoreDeviceErrors=false", appAPIURL, c.me.ID)
-	body := map[string]any{
-		"currentState": map[string]string{"type": "off"},
-	}
-	var resp TemperatureState
-	if err := c.doJSON(ctx, http.MethodPut, url, body, &resp); err != nil {
-		return fmt.Errorf("failed to turn off device: %w", err)
-	}
-
-	if len(resp.Devices) == 0 {
-		return fmt.Errorf("no devices in turn-off response")
-	}
-
-	for _, device := range resp.Devices {
-		if device.CurrentState.Type != "off" {
-			return fmt.Errorf("failed to turn off device %s: %s", device.Device.DeviceID, device.CurrentState.Type)
-		}
-	}
-
-	return nil
-}
-
-func (c *Client) GetTemperatureState(ctx context.Context) (*TemperatureState, error) {
-	url := fmt.Sprintf("%s/v1/users/%s/temperature/pod?ignoreDeviceErrors=false", appAPIURL, c.me.ID)
-	var resp TemperatureState
-	if err := c.doJSON(ctx, http.MethodGet, url, nil, &resp); err != nil {
-		return nil, fmt.Errorf("failed to get temperature state: %w", err)
-	}
-	return &resp, nil
-}
-
-// temperatureTolerance is the acceptable difference in heating levels for validation
-const temperatureTolerance = 2
-
-// ParseTemperature parses a temperature string like "68F" or "24C" into value and unit
-func ParseTemperature(degrees string) (int, UnitOfTemperature, error) {
-	var unit UnitOfTemperature
-	switch {
-	case strings.HasSuffix(degrees, "C"):
-		unit = Celsius
-	case strings.HasSuffix(degrees, "F"):
-		unit = Fahrenheit
-	default:
-		return 0, "", fmt.Errorf("invalid temperature format: %s (must end with C or F)", degrees)
-	}
-	temp, err := strconv.Atoi(strings.TrimRight(degrees, "CF"))
-	if err != nil {
-		return 0, "", fmt.Errorf("invalid temperature value: %s", degrees)
-	}
-	return temp, unit, nil
-}
-
-func (c *Client) SetTemperature(ctx context.Context, degrees string) error {
-	temp, unit, err := ParseTemperature(degrees)
+// Info pretty-prints the raw API payloads that back the app's main screens. One failing payload
+// does not stop the rest; every failure is reported at the end.
+func (c *Client) Info(ctx context.Context) error {
+	trendsURL, err := c.trendsURL(c.me.ID, time.Now().AddDate(0, 0, -1), time.Now())
 	if err != nil {
 		return err
 	}
-
-	expectedLevel := TempToHeatingLevel(temp, unit)
-	url := fmt.Sprintf("%s/v1/users/%s/temperature/pod?ignoreDeviceErrors=false", appAPIURL, c.me.ID)
-	body := map[string]any{
-		"currentLevel": expectedLevel,
+	dumps := []struct{ title, url string }{
+		{"TEMPERATURE", c.temperatureURL(c.me.ID)},
+		{"AWAY MODE", c.appAPIURL + "/v1/users/" + c.me.ID + "/away-mode"},
+		{"TRENDS", trendsURL},
+		{"INTERVALS", c.clientAPIURL + "/users/" + c.me.ID + "/intervals"},
+		{"ALARMS", c.appAPIURL + "/v2/users/" + c.me.ID + "/alarms"},
+		{"HEALTH SURVEY TEST DRIVE", c.appAPIURL + "/v1/health-survey/test-drive"},
+		{"SUBSCRIPTIONS", c.appAPIURL + "/v3/users/" + c.me.ID + "/subscriptions"},
+		{"AUTOPILOT DETAILS", c.appAPIURL + "/v1/users/" + c.me.ID + "/autopilotDetails"},
 	}
-	var resp TemperatureState
-	if err := c.doJSON(ctx, http.MethodPut, url, body, &resp); err != nil {
-		return fmt.Errorf("failed to set temperature: %w", err)
-	}
-
-	if len(resp.Devices) == 0 {
-		return fmt.Errorf("no devices in temperature response")
-	}
-
-	// Validate response with tolerance
-	for _, device := range resp.Devices {
-		if diff := abs(device.CurrentLevel - expectedLevel); diff > temperatureTolerance {
-			return fmt.Errorf("failed to set temperature on device %s: expected level %d, got %d (diff %d > tolerance %d)",
-				device.Device.DeviceID, expectedLevel, device.CurrentLevel, diff, temperatureTolerance)
+	var failures []error
+	for _, dump := range dumps {
+		var data map[string]any
+		if err := c.doJSON(ctx, http.MethodGet, dump.url, nil, &data); err != nil {
+			failures = append(failures,
+				fmt.Errorf("failed to fetch %s: %w", strings.ToLower(dump.title), err))
+			continue
+		}
+		log.Info(dump.title)
+		if err := prettyPrint(data); err != nil {
+			return err
 		}
 	}
-
-	// Re-verify by querying actual state
-	verifyState, err := c.GetTemperatureState(ctx)
-	if err != nil {
-		log.Warn("failed to verify temperature state after set", "err", err)
-		return nil
-	}
-
-	if len(verifyState.Devices) == 0 {
-		log.Warn("no devices in verification response")
-		return nil
-	}
-
-	for _, device := range verifyState.Devices {
-		if diff := abs(device.CurrentLevel - expectedLevel); diff > temperatureTolerance {
-			log.Warn("temperature verification mismatch",
-				"device", device.Device.DeviceID,
-				"expected", expectedLevel,
-				"actual", device.CurrentLevel,
-				"diff", diff)
-		}
-	}
-
-	return nil
-}
-
-func (c *Client) Info(ctx context.Context) (map[string]any, error) {
-	if err := c.fetchTrends(ctx); err != nil {
-		return nil, fmt.Errorf("failed to fetch trends: %w", err)
-	}
-	if err := c.fetchIntervals(ctx); err != nil {
-		return nil, fmt.Errorf("failed to fetch intervals: %w", err)
-	}
-	if err := c.fetchRoutines(ctx); err != nil {
-		return nil, fmt.Errorf("failed to fetch routines: %w", err)
-	}
-	if err := c.fetchHealthSurveyTestDrive(ctx); err != nil {
-		return nil, fmt.Errorf("failed to fetch health survey test drive: %w", err)
-	}
-	if err := c.fetchSubscriptions(ctx); err != nil {
-		return nil, fmt.Errorf("failed to fetch subscriptions: %w", err)
-	}
-	if err := c.fetchAutopilotDetails(ctx); err != nil {
-		return nil, fmt.Errorf("failed to fetch autopilot details: %w", err)
-	}
-	return nil, nil
+	return errors.Join(failures...)
 }
 
 func (c *Client) GetReleaseFeatures(ctx context.Context) (map[string]any, error) {
-	url := appAPIURL + "/v1/users/" + c.me.ID + "/release-features"
+	url := c.appAPIURL + "/v1/users/" + c.me.ID + "/release-features"
 	var data map[string]any
 	if err := c.doJSON(ctx, http.MethodGet, url, nil, &data); err != nil {
 		return nil, fmt.Errorf("failed to fetch release features: %w", err)
@@ -337,104 +265,54 @@ func (c *Client) GetReleaseFeatures(ctx context.Context) (map[string]any, error)
 	return data, nil
 }
 
-func (c *Client) GetAudioTracks(ctx context.Context) (map[string]any, error) {
-	url := appAPIURL + "/v1/audio/categories"
-	var data map[string]any
+// AudioCategory is one audio category together with the tracks it contains.
+type AudioCategory struct {
+	ID     string           `json:"id"`
+	Name   string           `json:"name"`
+	Tracks []map[string]any `json:"tracks"`
+}
+
+func (c *Client) GetAudioTracks(ctx context.Context) ([]AudioCategory, error) {
+	var data struct {
+		Categories []AudioCategory `json:"categories"`
+	}
+	url := c.appAPIURL + "/v1/audio/categories"
 	if err := c.doJSON(ctx, http.MethodGet, url, nil, &data); err != nil {
 		return nil, fmt.Errorf("failed to fetch audio categories: %w", err)
 	}
-	categories := data["categories"].([]any)
-	for idx, category := range categories {
-		url := appAPIURL + "/v1/users/" + c.me.ID + "/audio/tracks?category=" + category.(map[string]any)["id"].(string)
-		var tracks map[string]any
-		if err := c.doJSON(ctx, http.MethodGet, url, nil, &tracks); err != nil {
-			return nil, fmt.Errorf("failed to fetch audio tracks: %w", err)
+	for idx, category := range data.Categories {
+		url := c.appAPIURL + "/v1/users/" + c.me.ID + "/audio/tracks?category=" + category.ID
+		var tracks struct {
+			Tracks []map[string]any `json:"tracks"`
 		}
-		categories[idx].(map[string]any)["tracks"] = tracks["tracks"]
-		// for _, track := range tracks["tracks"].([]any) {
-		// 	url := appAPIURL + "/v1/audio/track/" + track.(map[string]any)["id"].(string)
-		// 	var trackDetails map[string]any
-		// 	if err := c.doJSON(ctx, http.MethodGet, url, nil, &trackDetails); err != nil {
-		// 		return nil, fmt.Errorf("failed to fetch audio track details: %w", err)
-		// 	}
-		// }
+		if err := c.doJSON(ctx, http.MethodGet, url, nil, &tracks); err != nil {
+			return nil, fmt.Errorf("failed to fetch audio tracks for %s: %w", category.ID, err)
+		}
+		data.Categories[idx].Tracks = tracks.Tracks
 	}
-	data["categories"] = categories
-	return data, nil
+	return data.Categories, nil
 }
 
-func (c *Client) SetAlarm(ctx context.Context, time string) error {
-	url := fmt.Sprintf("%s/v2/users/%s/routines/%s", appAPIURL, c.me.ID, "1234")
+// Prime starts a priming cycle on the pod and asks for a completion notification for the user.
+func (c *Client) Prime(ctx context.Context) error {
+	device, err := c.primaryDevice()
+	if err != nil {
+		return err
+	}
+	if device.Priming {
+		return fmt.Errorf("device %s is already priming", device.ID)
+	}
+	url := c.appAPIURL + "/v1/devices/" + device.ID + "/priming/tasks"
 	body := map[string]any{
-		"id":      "1234",
-		"alarms":  []any{},
-		"days":    []string{"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"},
-		"enabled": true,
-		"bedtime": map[string]any{
-			"time":      "22:30:00",
-			"dayOffset": "MinusOne",
-		},
-		"alarmsToCreate": []map[string]any{
-			{
-				"enabled":              true,
-				"disabledIndividually": false,
-				"timeWithOffset": map[string]any{
-					"time":      time,
-					"dayOffset": "Zero",
-				},
-				"settings": map[string]any{
-					"vibration": map[string]any{
-						"enabled":    true,
-						"powerLevel": 50,
-						"pattern":    "rise",
-					},
-					"thermal": map[string]any{
-						"enabled": true,
-						"level":   20,
-					},
-				},
-				"dismissedUntil": "1970-01-01T00:00:00Z",
-				"snoozedUntil":   "1970-01-01T00:00:00Z",
-			},
+		"notifications": map[string]any{
+			"users": []string{c.me.ID},
+			"meta":  "rePriming",
 		},
 	}
-	var resp map[string]any
-	if err := c.doJSON(ctx, http.MethodPut, url, body, &resp); err != nil {
-		return fmt.Errorf("failed to set alarm: %w", err)
-	}
-	// TODO: check if alarm was set successfully via response JSON
-	if log.GetLevel() == log.DebugLevel {
-		if err := prettyPrint(resp); err != nil {
-			return fmt.Errorf("failed to pretty print response: %w", err)
-		}
+	if err := c.doJSON(ctx, http.MethodPost, url, body, nil); err != nil {
+		return fmt.Errorf("failed to start priming: %w", err)
 	}
 	return nil
-}
-
-func (c *Client) Status(ctx context.Context) {
-	for _, device := range c.devices {
-		if device.LeftKelvin.Active || device.RightKelvin.Active {
-			fmt.Printf("Eight Sleep is ON\n")
-			if device.LeftKelvin.Active {
-				fmt.Printf("Left side: %s\n", device.LeftKelvin.CurrentActivity)
-				if device.LeftHeatingLevel < device.LeftTargetHeatingLevel {
-					fmt.Printf("Left side target heating to level %d from %d\n", device.LeftTargetHeatingLevel, device.LeftHeatingLevel)
-				} else if device.LeftHeatingLevel > device.LeftTargetHeatingLevel {
-					fmt.Printf("Left side target cooling to level %d from %d\n", device.LeftTargetHeatingLevel, device.LeftHeatingLevel)
-				}
-			}
-			if device.RightKelvin.Active {
-				fmt.Printf("Right side: %s\n", device.RightKelvin.CurrentActivity)
-				if device.RightHeatingLevel < device.RightTargetHeatingLevel {
-					fmt.Printf("Right side target heating to level %d from %d\n", device.RightTargetHeatingLevel, device.RightHeatingLevel)
-				} else if device.RightHeatingLevel > device.RightTargetHeatingLevel {
-					fmt.Printf("Right side target cooling to level %d from %d\n", device.RightTargetHeatingLevel, device.RightHeatingLevel)
-				}
-			}
-		} else {
-			fmt.Printf("Eight Sleep is OFF\n")
-		}
-	}
 }
 
 /* -------------------- internal helpers -------------------- */
@@ -443,7 +321,6 @@ func (c *Client) headers() http.Header {
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "application/json")
-	h.Set("Accept-Encoding", "gzip")
 	h.Set("User-Agent", "okhttp/4.9.3")
 	h.Set("Connection", "keep-alive")
 	c.mu.RLock()
@@ -464,23 +341,13 @@ func (c *Client) clearToken() {
 
 func (c *Client) refreshToken(ctx context.Context) error {
 	c.mu.RLock()
-	needsRefresh := c.token == nil || time.Until(c.token.Expiration) < time.Second*tokenRefreshBufferSec
+	needsRefresh := c.token == nil ||
+		time.Until(c.token.Expiration) < time.Second*tokenRefreshBufferSec
 	c.mu.RUnlock()
 	if !needsRefresh {
 		return nil
 	}
 
-	err := retryWithBackoff(ctx, func() error {
-		return c.doTokenRefresh(ctx)
-	})
-	if err != nil {
-		return fmt.Errorf("token refresh failed: %w", err)
-	}
-	return nil
-}
-
-// doTokenRefresh performs the actual token refresh request
-func (c *Client) doTokenRefresh(ctx context.Context) error {
 	body := map[string]string{
 		"client_id":     c.clientID,
 		"client_secret": c.clientSecret,
@@ -493,8 +360,11 @@ func (c *Client) doTokenRefresh(ctx context.Context) error {
 		ExpiresIn   float64 `json:"expires_in"`
 		UserID      string  `json:"userId"`
 	}
-	if err := c.doJSON(ctx, http.MethodPost, authURL, body, &res); err != nil {
-		return fmt.Errorf("failed to refresh token: %w", err)
+	if err := c.doJSON(ctx, http.MethodPost, c.authURL, body, &res); err != nil {
+		return fmt.Errorf("token refresh failed: %w", err)
+	}
+	if res.AccessToken == "" {
+		return errors.New("token refresh failed: response has no access_token")
 	}
 
 	c.mu.Lock()
@@ -509,7 +379,7 @@ func (c *Client) doTokenRefresh(ctx context.Context) error {
 }
 
 func (c *Client) fetchProfile(ctx context.Context) error {
-	url := clientAPIURL + "/users/me"
+	url := c.clientAPIURL + "/users/me"
 	var data struct {
 		User Profile `json:"user"`
 	}
@@ -530,22 +400,6 @@ func (c *Client) fetchProfile(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) fetchDevices(ctx context.Context) error {
-	for _, device := range c.me.Devices {
-		reqURL := clientAPIURL + "/devices/" + device
-		var data struct {
-			Result Device `json:"result"`
-		}
-		if err := c.doJSON(ctx, http.MethodGet, reqURL, nil, &data); err != nil {
-			return fmt.Errorf("failed to fetch device %s: %w", device, err)
-		}
-		c.mu.Lock()
-		c.devices = append(c.devices, data.Result)
-		c.mu.Unlock()
-	}
-	return nil
-}
-
 // RefreshDevices refreshes the cached device list from the API.
 // Call this periodically from daemon to keep device cache fresh.
 func (c *Client) RefreshDevices(ctx context.Context) error {
@@ -555,7 +409,7 @@ func (c *Client) RefreshDevices(ctx context.Context) error {
 
 	var newDevices []Device
 	for _, deviceID := range deviceIDs {
-		reqURL := clientAPIURL + "/devices/" + deviceID
+		reqURL := c.clientAPIURL + "/devices/" + deviceID
 		var data struct {
 			Result Device `json:"result"`
 		}
@@ -573,151 +427,55 @@ func (c *Client) RefreshDevices(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) fetchTrends(ctx context.Context) error {
-	url, err := url.Parse(clientAPIURL + "/users/" + c.me.ID + "/trends")
-	if err != nil {
-		return fmt.Errorf("failed to parse trends URL: %w", err)
+// primaryDevice returns the first pod on the account.
+func (c *Client) primaryDevice() (Device, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.devices) == 0 {
+		return Device{}, errors.New("no Eight Sleep devices found on this account")
 	}
-	q := url.Query()
-	q.Add("tz", c.devices[0].Timezone)
-	q.Add("from", time.Now().AddDate(0, 0, -1).Format(time.DateOnly))
-	q.Add("to", time.Now().Format(time.DateOnly))
-	q.Add("include-main", "false")
-	q.Add("include-all-sessions", "true")
-	q.Add("model-version", "v2")
-	url.RawQuery = q.Encode()
-	// var data struct {
-	// 	Days          []any  `json:"days"`
-	// 	ModelVersion  string `json:"modelVersion"`
-	// 	SfsCalculator string `json:"sfsCalculator"`
-	// }
-	var data map[string]any
-	if err := c.doJSON(ctx, http.MethodGet, url.String(), nil, &data); err != nil {
-		return fmt.Errorf("failed to fetch trends: %w", err)
-	}
-	c.mu.Lock()
-	log.Info("TRENDS")
-	if err := prettyPrint(data); err != nil {
-		return fmt.Errorf("failed to pretty print response: %w", err)
-	}
-	c.mu.Unlock()
-	return nil
+	return c.devices[0], nil
 }
 
-func (c *Client) fetchIntervals(ctx context.Context) error {
-	url, err := url.Parse(clientAPIURL + "/users/" + c.me.ID + "/intervals")
+// send performs a single HTTP attempt and classifies the failure for retryWithBackoff.
+func (c *Client) send(ctx context.Context, method, reqURL string, payload []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("failed to parse intervals URL: %w", err)
+		return nil, permanentError{fmt.Errorf("failed to create request: %w", err)}
 	}
-	// var data struct {
-	// 	Settings struct {
-	// 		Routines     []any `json:"routines"`
-	// 		OneOffAlarms []any `json:"oneOffAlarms"`
-	// 	} `json:"settings"`
-	// 	State struct {
-	// 		Status    string `json:"status"`
-	// 		NextAlarm struct {
-	// 			NextTimestamp string `json:"nextTimestamp"`
-	// 		} `json:"nextAlarm"`
-	// 	} `json:"state"`
-	// }
-	var data map[string]any
-	if err := c.doJSON(ctx, http.MethodGet, url.String(), nil, &data); err != nil {
-		return fmt.Errorf("failed to fetch intervals: %w", err)
+	req.Header = c.headers()
+
+	res, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute %s request: %w", method, err)
 	}
-	c.mu.Lock()
-	log.Info("INTERVALS")
-	if err := prettyPrint(data); err != nil {
-		return fmt.Errorf("failed to pretty print response: %w", err)
+	defer func() { _ = res.Body.Close() }()
+
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
-	c.mu.Unlock()
-	return nil
+	if res.StatusCode < 300 {
+		return data, nil
+	}
+
+	httpErr := &HTTPError{StatusCode: res.StatusCode}
+	// Auth responses can echo credentials, so their bodies never reach errors or logs.
+	if reqURL != c.authURL {
+		httpErr.Body = strings.TrimSpace(string(data[:min(len(data), maxErrorBodyBytes)]))
+	}
+	switch {
+	case res.StatusCode == http.StatusTooManyRequests:
+		seconds, _ := strconv.Atoi(res.Header.Get("Retry-After"))
+		return nil, retryAfterError{httpErr, time.Duration(seconds) * time.Second}
+	case res.StatusCode >= 400 && res.StatusCode < 500:
+		return nil, permanentError{httpErr}
+	}
+	return nil, httpErr
 }
 
-func (c *Client) fetchRoutines(ctx context.Context) error {
-	url, err := url.Parse(appAPIURL + "/v2/users/" + c.me.ID + "/routines")
-	if err != nil {
-		return fmt.Errorf("failed to parse routines URL: %w", err)
-	}
-	// var data struct {
-	// 	Settings struct {
-	// 		Routines     []any `json:"routines"`
-	// 		OneOffAlarms []any `json:"oneOffAlarms"`
-	// 	} `json:"settings"`
-	// 	State struct {
-	// 		Status    string `json:"status"`
-	// 		NextAlarm struct {
-	// 			NextTimestamp string `json:"nextTimestamp"`
-	// 		} `json:"nextAlarm"`
-	// 	} `json:"state"`
-	// }
-	var data map[string]any
-	if err := c.doJSON(ctx, http.MethodGet, url.String(), nil, &data); err != nil {
-		return fmt.Errorf("failed to fetch routines: %w", err)
-	}
-	c.mu.Lock()
-	log.Info("ROUTINES")
-	if err := prettyPrint(data); err != nil {
-		return fmt.Errorf("failed to pretty print response: %w", err)
-	}
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *Client) fetchHealthSurveyTestDrive(ctx context.Context) error {
-	url, err := url.Parse(appAPIURL + "/v1/health-survey/test-drive")
-	if err != nil {
-		return fmt.Errorf("failed to parse health survey test drive URL: %w", err)
-	}
-	var data map[string]any
-	if err := c.doJSON(ctx, http.MethodGet, url.String(), nil, &data); err != nil {
-		return fmt.Errorf("failed to fetch routines: %w", err)
-	}
-	c.mu.Lock()
-	log.Info("HEALTH SURVEY TEST DRIVE")
-	if err := prettyPrint(data); err != nil {
-		return fmt.Errorf("failed to pretty print response: %w", err)
-	}
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *Client) fetchSubscriptions(ctx context.Context) error {
-	url, err := url.Parse(appAPIURL + "/v3/users/" + c.me.ID + "/subscriptions")
-	if err != nil {
-		return fmt.Errorf("failed to parse subscriptions URL: %w", err)
-	}
-	var data map[string]any
-	if err := c.doJSON(ctx, http.MethodGet, url.String(), nil, &data); err != nil {
-		return fmt.Errorf("failed to fetch subscriptions: %w", err)
-	}
-	c.mu.Lock()
-	log.Info("SUBSCRIPTIONS")
-	if err := prettyPrint(data); err != nil {
-		return fmt.Errorf("failed to pretty print response: %w", err)
-	}
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *Client) fetchAutopilotDetails(ctx context.Context) error {
-	url, err := url.Parse(appAPIURL + "/v1/users/" + c.me.ID + "/autopilotDetails")
-	if err != nil {
-		return fmt.Errorf("failed to parse autopilot details URL: %w", err)
-	}
-	var data map[string]any
-	log.Info("AUTOPILOT DETAILS")
-	if err := c.doJSON(ctx, http.MethodGet, url.String(), nil, &data); err != nil {
-		return fmt.Errorf("failed to fetch autopilot details: %w", err)
-	}
-	c.mu.Lock()
-	if err := prettyPrint(data); err != nil {
-		return fmt.Errorf("failed to pretty print response: %w", err)
-	}
-	c.mu.Unlock()
-	return nil
-}
-
+// doJSON sends an authenticated JSON request and decodes the response into out.
+// A nil out discards the response body.
 func (c *Client) doJSON(ctx context.Context, method, reqURL string, payload any, out any) error {
 	var payloadBytes []byte
 	if payload != nil {
@@ -728,80 +486,51 @@ func (c *Client) doJSON(ctx context.Context, method, reqURL string, payload any,
 		payloadBytes = b
 	}
 
+	isAuth := reqURL == c.authURL
+	if !isAuth {
+		if err := c.refreshToken(ctx); err != nil {
+			return err
+		}
+	}
+
 	var data []byte
-	var got401 bool
-
 	doRequest := func() error {
-		return retryWithBackoff(ctx, func() error {
-			body := bytes.NewReader(payloadBytes)
-			req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
-			if err != nil {
-				return permanentError{fmt.Errorf("failed to create request: %w", err)}
-			}
-			req.Header = c.headers()
-
-			res, err := c.http.Do(req)
-			if err != nil {
-				return fmt.Errorf("failed to execute %s request: %w", method, err)
-			}
-			defer res.Body.Close()
-
-			data, err = io.ReadAll(res.Body)
-			if err != nil {
-				return fmt.Errorf("failed to read response body: %w", err)
-			}
-
-			if res.StatusCode >= 300 {
-				httpErr := fmt.Errorf("HTTP %d: %s", res.StatusCode, res.Status)
-
-				if res.StatusCode == 401 {
-					got401 = true
-					return permanentError{httpErr}
-				}
-
-				if res.StatusCode >= 400 && res.StatusCode < 500 && res.StatusCode != 429 {
-					return permanentError{httpErr}
-				}
-				return httpErr
-			}
-
-			if res.Header.Get("Content-Encoding") == "gzip" {
-				gzipReader, err := gzip.NewReader(bytes.NewReader(data))
-				if err != nil {
-					return permanentError{fmt.Errorf("failed to create gzip reader: %w", err)}
-				}
-				data, err = io.ReadAll(gzipReader)
-				if err != nil {
-					return fmt.Errorf("failed to read gzipped response body: %w", err)
-				}
-			}
-
-			return nil
+		return retryWithBackoff(ctx, c.retryInterval, func() error {
+			var err error
+			data, err = c.send(ctx, method, reqURL, payloadBytes)
+			return err
 		})
 	}
 
 	err := doRequest()
 
-	// Handle 401 with re-auth retry (skip for auth endpoint to avoid infinite loop)
-	if got401 && reqURL != authURL {
+	// Handle 401 with a single re-auth (skip for auth endpoint to avoid infinite loop)
+	var httpErr *HTTPError
+	if !isAuth && errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusUnauthorized {
 		log.Info("received 401, clearing token and re-authenticating")
 		c.clearToken()
-
 		if refreshErr := c.refreshToken(ctx); refreshErr != nil {
 			return fmt.Errorf("re-auth failed after 401: %w", refreshErr)
 		}
-
-		got401 = false
 		err = doRequest()
 	}
-
 	if err != nil {
 		return err
 	}
 
-	log.Debugf("HTTP %s %s\n%s", method, reqURL, string(data))
+	if isAuth {
+		log.Debugf("HTTP %s %s (body withheld)", method, reqURL)
+	} else {
+		log.Debugf("HTTP %s %s\n%s", method, reqURL, string(data))
+	}
 
-	return json.NewDecoder(bytes.NewReader(data)).Decode(out)
+	if out == nil || len(bytes.TrimSpace(data)) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("failed to decode %s %s response: %w", method, reqURL, err)
+	}
+	return nil
 }
 
 func prettyPrint(data any) error {
@@ -809,7 +538,8 @@ func prettyPrint(data any) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal json: %v", err)
 	}
-	if err := quick.Highlight(os.Stdout, string(jsonData)+"\n", "json", "terminal256", "nord"); err != nil {
+	err = quick.Highlight(os.Stdout, string(jsonData)+"\n", "json", "terminal256", "nord")
+	if err != nil {
 		return fmt.Errorf("failed to highlight json: %v", err)
 	}
 	return nil
